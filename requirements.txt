@@ -14,3 +14,5 @@ langgraph
 langgraph-checkpoint-postgres
 langchain-nvidia-ai-endpoints
 langsmith
+google-api-python-client
+google-auth

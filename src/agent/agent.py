@@ -2,12 +2,14 @@ import os
 from typing import Dict, Any, List, Optional
 from pydantic import BaseModel
 from typing_extensions import TypedDict, Annotated
+from datetime import datetime
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, BaseMessage
 from typing import Any as _Any
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.graph.message import add_messages
+from langgraph.checkpoint.postgres import PostgresSaver
 from src.agent.tools import (
     registrar_cliente,
     contar_registros,
@@ -89,6 +91,9 @@ class ChatbotGraph:
             raise ValueError("Se requiere un checkpointer para inicializar ChatbotGraph")
         self.within_thread_memory = checkpointer
         
+        # Guardar la URL de PostgreSQL para reconexión
+        self.postgres_url = os.getenv("POSTGRES_URL") or os.getenv("DATABASE_URL")
+        
         # Construir y compilar el grafo
         self.graph = self._build_graph()
         
@@ -101,6 +106,35 @@ class ChatbotGraph:
             self.message_history_limit = int(os.getenv("MESSAGE_HISTORY_LIMIT", "10"))
         except Exception:
             self.message_history_limit = 10
+    
+    def _recreate_checkpointer(self):
+        """Recrear completamente el checkpointer cuando hay problemas de conexión"""
+        try:
+            logger.warning("Recreating PostgreSQL checkpointer due to connection issues...")
+            
+            if not self.postgres_url:
+                raise ValueError("No PostgreSQL URL available for reconnection")
+            
+            # Crear nuevo checkpointer desde la URL
+            saver_cm = PostgresSaver.from_conn_string(self.postgres_url)
+            new_checkpointer = saver_cm.__enter__()
+            new_checkpointer.setup()
+            
+            # Reemplazar el checkpointer actual
+            old_checkpointer = self.within_thread_memory
+            self.within_thread_memory = new_checkpointer
+            
+            # Recompilar el grafo con el nuevo checkpointer
+            graph_name = os.getenv("GRAPH_NAME", "chatbot_graph_v1")
+            self.graph_name = graph_name
+            self.graph = self._build_graph()
+            
+            logger.info("PostgreSQL checkpointer recreated successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to recreate checkpointer: {str(e)}")
+            return False
     
     def _get_last_messages(self, state: "AdaptiveAgentState", limit: Optional[int] = None) -> List[BaseMessage]:
         effective_limit = limit if isinstance(limit, int) and limit > 0 else self.message_history_limit
@@ -513,7 +547,7 @@ class ChatbotGraph:
         )
     
     def process_message(self, message: str, user_id: str) -> Dict[str, Any]:
-        config = {"configurable": {"thread_id": user_id, "user_id": user_id, "checkpoint_ns": self.graph_name}}
+        config = {"configurable": {"thread_id": user_id}}
         input_messages = [HumanMessage(content=message)]
         
         # Inicializar el estado con todos los campos requeridos
@@ -528,48 +562,100 @@ class ChatbotGraph:
             "retry_count": 0
         }
         
-        result = self.graph.invoke(initial_state, config)
-        ai_message = result["messages"][-1]
-        
-        return {
-            "answer": ai_message.content,
-            "user": user_id,
-            "thread_id": user_id
-        }
+        # Retry logic para problemas de conexión PostgreSQL
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                result = self.graph.invoke(initial_state, config)
+                ai_message = result["messages"][-1]
+                
+                return {
+                    "response": ai_message.content,
+                    "status": "success",
+                    "timestamp": datetime.now().isoformat()
+                }
+                
+            except Exception as e:
+                error_msg = str(e).lower()
+                is_connection_error = any(keyword in error_msg for keyword in [
+                    'connection', 'ssl', 'closed', 'timeout', 'network'
+                ])
+                
+                if is_connection_error and attempt < max_retries - 1:
+                    logger.warning(f"Connection error on attempt {attempt + 1}/{max_retries} for user {user_id}: {str(e)}")
+                    # Recrear completamente el checkpointer
+                    if self._recreate_checkpointer():
+                        continue
+                    else:
+                        # Si no se pudo recrear, fallar inmediatamente
+                        break
+                else:
+                    # Re-lanzar la excepción para que la maneje el controller
+                    raise e
     
     def get_chat_history(self, user_id: str) -> List[Dict[str, Any]]:
-        thread = {"configurable": {"thread_id": user_id, "checkpoint_ns": self.graph_name}}
-        state = self.graph.get_state(thread).values
-
-        if not state:
+        config = {"configurable": {"thread_id": user_id}}
+        
+        # Implementar retry logic para problemas de conexión PostgreSQL
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                graph_state = self.graph.get_state(config)
+                state = graph_state.values if graph_state else None
+                
+                if not state or not state.get("messages"):
+                    return []
+                
+                # Si llegamos aquí, la conexión funcionó
+                break
+                    
+            except ValueError as e:
+                # Capturar el error "Subgraph not found" para usuarios sin historial previo
+                if "not found" in str(e):
+                    return []
+                else:
+                    raise e
+            except Exception as e:
+                error_msg = str(e).lower()
+                is_connection_error = any(keyword in error_msg for keyword in [
+                    'connection', 'ssl', 'closed', 'timeout', 'network'
+                ])
+                
+                if is_connection_error and attempt < max_retries - 1:
+                    logger.warning(f"Connection error on attempt {attempt + 1}/{max_retries} for user {user_id}: {str(e)}")
+                    # Recrear completamente el checkpointer
+                    if self._recreate_checkpointer():
+                        continue
+                    else:
+                        # Si no se pudo recrear, fallar inmediatamente
+                        break
+                else:
+                    logger.error(f"Error getting chat history for user {user_id}: {str(e)}")
+                    return []
+        else:
+            # Si agotamos todos los reintentos
+            logger.error(f"Failed to get chat history for user {user_id} after {max_retries} attempts")
             return []
         
         # Convertir los mensajes a un formato más simple para la API
+        # Solo mostrar mensajes "human" y mensajes AI que NO sean herramientas
         formatted_messages = []
-        logger.info(f"Chat history: {state['messages']}")
+        
         for m in state["messages"]:
             if isinstance(m, BaseMessage):
-                message_data = {
-                    "role": m.type,
-                    "text": m.content  # Valor por defecto
-                }
-                
-                # Caso especial para AIMessage con tool_calls
-                if isinstance(m, AIMessage) and hasattr(m, 'tool_calls') and m.tool_calls:
-                    tool_calls_content = []
-                    for tool_call in m.tool_calls:
-                        tool_info = {
-                            "tool_name": tool_call.get("name", ""),
-                            "parameters": tool_call.get("args", {})
-                        }
-                        tool_calls_content.append(tool_info)
-                    
-                    # Si hay tool_calls, sobrescribimos el content
-                    message_data["content"] = {
-                        "tool_calls": tool_calls_content,
-                        "original_content": m.content  # Mantenemos el original por si acaso
+                # Filtrar solo mensajes humanos o AI sin tool_calls
+                if m.type == "human":
+                    message_data = {
+                        "role": m.type,
+                        "content": m.content
                     }
-                
-                formatted_messages.append(message_data)
+                    formatted_messages.append(message_data)
+                elif isinstance(m, AIMessage) and (not hasattr(m, 'tool_calls') or not m.tool_calls):
+                    # Solo mensajes AI que NO tengan tool_calls
+                    message_data = {
+                        "role": m.type,
+                        "content": m.content
+                    }
+                    formatted_messages.append(message_data)
         
         return formatted_messages
