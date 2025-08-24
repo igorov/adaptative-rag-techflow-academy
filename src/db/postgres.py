@@ -21,7 +21,7 @@ def init_pool(dsn: Optional[str] = None, min_size: int = 1, max_size: int = 10) 
     ----------
     dsn: Optional[str]
         PostgreSQL connection string. If not provided, reads from
-        environment variables ``POSTGRES_URL`` or ``DATABASE_URL``.
+        environment variables ``POSTGRES_USER``, ``POSTGRES_PASSWORD``, ``POSTGRES_HOST``, ``POSTGRES_PORT``, ``POSTGRES_DB``.
     min_size: int
         Minimum number of pooled connections.
     max_size: int
@@ -36,9 +36,16 @@ def init_pool(dsn: Optional[str] = None, min_size: int = 1, max_size: int = 10) 
     if _pool is not None:
         return _pool
 
-    effective_dsn = dsn or os.getenv("POSTGRES_URL") or os.getenv("DATABASE_URL")
-    if not effective_dsn:
-        raise ValueError("POSTGRES_URL o DATABASE_URL no está configurado en el entorno")
+    postgres_user = os.getenv('POSTGRES_USER')
+    postgres_password = os.getenv('POSTGRES_PASSWORD')
+    postgres_host = os.getenv('POSTGRES_HOST')
+    postgres_port = os.getenv('POSTGRES_PORT')
+    postgres_db = os.getenv('POSTGRES_TECHFLOW_DATABASE')
+
+    postgres_url = f"postgresql://{postgres_user}:{postgres_password}@{postgres_host}:{postgres_port}/{postgres_db}?sslmode=require&channel_binding=require"
+    effective_dsn = dsn or postgres_url
+    if not postgres_user or not postgres_password or not postgres_host or not postgres_port or not postgres_db:
+        raise ValueError("POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB no están configurados en .env")
 
     _pool = ConnectionPool(effective_dsn, min_size=min_size, max_size=max_size)
     return _pool

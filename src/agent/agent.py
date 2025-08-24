@@ -92,7 +92,13 @@ class ChatbotGraph:
         self.within_thread_memory = checkpointer
         
         # Guardar la URL de PostgreSQL para reconexión
-        self.postgres_url = os.getenv("POSTGRES_URL") or os.getenv("DATABASE_URL")
+        postgres_user = os.getenv('POSTGRES_USER')
+        postgres_password = os.getenv('POSTGRES_PASSWORD')
+        postgres_host = os.getenv('POSTGRES_HOST')
+        postgres_port = os.getenv('POSTGRES_PORT')
+        postgres_db = os.getenv('POSTGRES_TECHFLOW_DATABASE')
+
+        self.postgres_url = f"postgresql://{postgres_user}:{postgres_password}@{postgres_host}:{postgres_port}/{postgres_db}?sslmode=require&channel_binding=require"
         
         # Construir y compilar el grafo
         self.graph = self._build_graph()

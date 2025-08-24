@@ -25,9 +25,16 @@ def initialize_chatbot_graph():
         chat_model = LLMFactory().create_chat_model(model_provider)
         
         # Instanciar checkpointer Postgres
-        postgres_url = os.getenv("POSTGRES_URL") or os.getenv("DATABASE_URL")
-        if not postgres_url:
-            raise ValueError("POSTGRES_URL o DATABASE_URL no está configurado en .env")
+        #postgres_url = os.getenv("POSTGRES_URL") or os.getenv("DATABASE_URL")
+        postgres_user = os.getenv('POSTGRES_USER')
+        postgres_password = os.getenv('POSTGRES_PASSWORD')
+        postgres_host = os.getenv('POSTGRES_HOST')
+        postgres_port = os.getenv('POSTGRES_PORT')
+        postgres_db = os.getenv('POSTGRES_TECHFLOW_DATABASE')
+
+        postgres_url = f"postgresql://{postgres_user}:{postgres_password}@{postgres_host}:{postgres_port}/{postgres_db}?sslmode=require&channel_binding=require"
+        if not postgres_user or not postgres_password or not postgres_host or not postgres_port or not postgres_db:
+            raise ValueError("POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB no están configurados en .env")
 
         # Inicializar pool de Postgres reutilizable para tools (misma instancia/DSN)
         init_pool(postgres_url)
